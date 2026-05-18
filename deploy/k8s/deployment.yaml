@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: http-server
+  labels:
+    app: http-server
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0       # zero-downtime deploys
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: http-server
+  template:
+    metadata:
+      labels:
+        app: http-server
+    spec:
+      terminationGracePeriodSeconds: 45   # must exceed SHUTDOWN_TIMEOUT (30s)
+      containers:
+        - name: http-server
+          image: http-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 443
+              name: https
+            - containerPort: 80
+              name: http
+          env:
+            # Point at ConfigMap mount (default in Dockerfile)
+            - name: CONFIG_PATH
+              value: /etc/http-server/config.toml
+            # TLS certs from cert-manager Secret (or other source)
+            # Remove these if using the proxy's built-in ACME
+            - name: TLS_CERT_PATH
+              value: /etc/http-server/certs/tls.crt
+            - name: TLS_KEY_PATH
+              value: /etc/http-server/certs/tls.key
+            # Prometheus metrics (Phase 3) — reserve port
+            # - name: METRICS_PORT
+            #   value: "9090"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/http-server/config.toml
+              subPath: config.toml
+              readOnly: true
+            # Mount TLS certs from cert-manager Secret
+            - name: tls-certs
+              mountPath: /etc/http-server/certs
+              readOnly: true
+          livenessProbe:
+            tcpSocket:
+              port: 443
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            tcpSocket:
+              port: 443
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+      volumes:
+        - name: config
+          configMap:
+            name: http-server-config
+        # TLS certificate Secret — create with cert-manager:
+        #   apiVersion: cert-manager.io/v1
+        #   kind: Certificate
+        #   metadata:
+        #     name: http-server-tls
+        #   spec:
+        #     secretName: http-server-tls
+        #     dnsNames:
+        #       - your-domain.com
+        #     issuerRef:
+        #       name: letsencrypt-prod
+        #       kind: ClusterIssuer
+        - name: tls-certs
+          secret:
+            secretName: http-server-tls
+            optional: true    # won't block startup if cert not ready

@@ -1,0 +1,8 @@
+target/
+.git/
+.gitignore
+*.md
+.env
+.env.example
+config.toml
+config.example.toml

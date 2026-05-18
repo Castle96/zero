@@ -1,0 +1,45 @@
+# HTTP Server Configuration
+# Copy this to config.toml (or set CONFIG_PATH env var).
+#
+# Environment variables always override these values, so you can use
+# this file for defaults and override at deploy time (12-factor app).
+
+[server]
+# Required: the domain for your TLS certificate
+domain = "your-domain.com"
+
+# Required: contact email for Let's Encrypt
+email = "your-email@example.com"
+
+# Optional (defaults shown)
+host = "0.0.0.0"
+port = 443
+
+[tls]
+# Directory to store certificates
+cert_dir = "certs/"
+
+# Use Let's Encrypt staging environment (true) or production (false)
+# Set to false for production to get valid certificates
+use_staging = true
+
+# HSTS (Strict-Transport-Security) settings
+# Set hsts_max_age to 0 to disable HSTS entirely
+hsts_max_age = 31536000       # 1 year in seconds
+hsts_include_subdomains = true
+
+# Reverse proxy routes — unmatched requests return 404
+# Each [[proxy]] entry adds one route prefix → upstream mapping.
+#
+# Requests whose path starts with `prefix` are forwarded to `upstream`
+# with the remainder of the path appended.
+# E.g. prefix="/api", upstream="http://localhost:3000" means a request
+# to /api/users becomes http://localhost:3000/api/users.
+
+# [[proxy]]
+# prefix = "/api"
+# upstream = "http://localhost:3000"
+
+# [[proxy]]
+# prefix = "/app"
+# upstream = "http://localhost:5173"

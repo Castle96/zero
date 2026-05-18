@@ -1,22 +1,29 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
     extract::Path,
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{Html, IntoResponse},
     routing::get,
     Json, Router,
 };
 use hyper::server::conn::http1;
 use tokio::net::TcpListener;
+use tokio::signal;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::timeout;
 use tower::util::ServiceExt;
+use tower_http::compression::CompressionLayer;
+use tower_http::cors::CorsLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
 mod acme;
 mod cert_manager;
+mod config;
 mod http_redirect;
 mod proxy;
 mod tls;
@@ -24,60 +31,31 @@ mod tls;
 use acme::LetsEncryptConfig;
 use anyhow::Result;
 use cert_manager::CertificateManager;
+use config::ResolvedConfig;
+use proxy::ReverseProxy;
 use tls::TlsConfig;
 use tokio_rustls::TlsAcceptor;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn load_config() -> Result<Config> {
-    dotenv::dotenv().ok();
-
-    let domain =
-        std::env::var("DOMAIN").map_err(|_| anyhow::anyhow!("DOMAIN not set in environment"))?;
-    let email =
-        std::env::var("EMAIL").map_err(|_| anyhow::anyhow!("EMAIL not set in environment"))?;
-    let cert_dir = std::env::var("CERT_DIR").unwrap_or_else(|_| "certs/".to_string());
-    let use_staging = std::env::var("USE_STAGING")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(true);
-    let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "443".to_string())
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid PORT value"))?;
-
-    Ok(Config {
-        domain,
-        email,
-        cert_dir,
-        use_staging,
-        host,
-        port,
-    })
-}
-
-struct Config {
-    domain: String,
-    email: String,
-    cert_dir: String,
-    use_staging: bool,
-    host: String,
-    port: u16,
-}
+// ---------------------------------------------------------------------------
+// Entrypoint
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let config = load_config()?;
+    let cfg = config::load()?;
 
-    info!("Starting HTTP server for domain: {}", config.domain);
+    info!("Starting HTTP server for domain: {}", cfg.domain);
 
+    // --- TLS / ACME provisioning ---
     let le_config = LetsEncryptConfig::new(
-        config.domain.clone(),
-        config.email,
-        &config.cert_dir,
-        config.use_staging,
+        cfg.domain.clone(),
+        cfg.email.clone(),
+        &cfg.cert_dir,
+        cfg.use_staging,
     );
 
     let tls_config = TlsConfig::load_from_le_config(&le_config)
@@ -94,12 +72,22 @@ async fn main() -> Result<()> {
 
     let (shutdown_tx, _) = broadcast::channel(1);
 
-    let cert_manager = CertificateManager::new(le_config.clone(), shared_acceptor.clone());
-    let cert_manager_handle = tokio::spawn(async move {
-        if let Err(e) = cert_manager.start_renewal_loop().await {
-            error!("Certificate manager loop failed: {}", e);
-        }
-    });
+    // --- Background tasks ---
+    // If TLS_CERT_PATH is set, the user is managing certs externally
+    // (e.g., via cert-manager in K8s) — skip the built-in ACME renewal loop.
+    let use_builtin_acme = std::env::var("TLS_CERT_PATH").is_err();
+
+    let cert_manager_handle = if use_builtin_acme {
+        let cert_manager = CertificateManager::new(le_config.clone(), shared_acceptor.clone());
+        Some(tokio::spawn(async move {
+            if let Err(e) = cert_manager.start_renewal_loop().await {
+                error!("Certificate manager loop failed: {}", e);
+            }
+        }))
+    } else {
+        info!("TLS_CERT_PATH is set — skipping built-in ACME renewal (using external cert management)");
+        None
+    };
 
     let http_redirect_handle = tokio::spawn(async {
         if let Err(e) = http_redirect::start_http_redirect_server().await {
@@ -109,13 +97,18 @@ async fn main() -> Result<()> {
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let app = create_router();
+    // --- Application router ---
+    let proxy_state = Arc::new(ReverseProxy::from_routes(cfg.proxy_routes.clone()).await);
+    let app = create_app(proxy_state, &cfg);
 
-    let addr = format!("{}:{}", config.host, config.port);
+    let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = TcpListener::bind(&addr).await?;
     info!("HTTPS server listening on https://{}", addr);
 
+    // --- Accept loop (with active connection tracking) ---
+    let active_connections = Arc::new(AtomicUsize::new(0));
     let mut shutdown_rx = shutdown_tx.subscribe();
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
 
     tokio::select! {
         result = async {
@@ -125,16 +118,23 @@ async fn main() -> Result<()> {
                         info!("Shutdown signal received, stopping listener");
                         break;
                     }
+                    _ = sigterm.recv() => {
+                        info!("SIGTERM received (Kubernetes shutdown), stopping listener");
+                        break;
+                    }
                     result = listener.accept() => {
                         match result {
                             Ok((socket, peer_addr)) => {
+                                active_connections.fetch_add(1, Ordering::SeqCst);
                                 let shared_acceptor = shared_acceptor.clone();
                                 let app = app.clone();
-                                let shutdown_tx = shutdown_tx.clone();
+                                let active = active_connections.clone();
 
                                 tokio::spawn(async move {
-                                    let _ = shutdown_tx;
-                                    if let Err(e) = handle_connection(socket, peer_addr, shared_acceptor, app).await {
+                                    let _guard = ConnectionGuard(active);
+                                    if let Err(e) = handle_connection(
+                                        socket, peer_addr, shared_acceptor, app,
+                                    ).await {
                                         error!("Connection error: {}", e);
                                     }
                                 });
@@ -154,22 +154,47 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("Stopping new connections, waiting for existing to drain...");
-
-    let _ = shutdown_tx.send(());
+    // --- Graceful drain ---
+    info!(
+        "Draining {} active connection(s)...",
+        active_connections.load(Ordering::SeqCst)
+    );
 
     match timeout(SHUTDOWN_TIMEOUT, async {
-        cert_manager_handle.abort();
-        http_redirect_handle.abort();
+        while active_connections.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     })
     .await
     {
-        Ok(_) => info!("Background tasks stopped"),
-        Err(_) => warn!("Shutdown timeout, forcing exit"),
+        Ok(()) => info!("All connections drained cleanly"),
+        Err(_) => warn!(
+            "Drain timeout reached, {} connection(s) still active",
+            active_connections.load(Ordering::SeqCst)
+        ),
     }
 
+    // --- Stop background tasks ---
+    let _ = shutdown_tx.send(());
+    if let Some(handle) = cert_manager_handle {
+        handle.abort();
+    }
+    http_redirect_handle.abort();
     info!("Server shutdown complete");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Connection handling
+// ---------------------------------------------------------------------------
+
+/// Drop guard that decrements the active-connection counter.
+struct ConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 async fn handle_connection(
@@ -183,6 +208,7 @@ async fn handle_connection(
         guard.clone()
     };
 
+    // TLS handshake (10s timeout)
     let tls_stream = timeout(Duration::from_secs(10), acceptor.accept(socket))
         .await
         .map_err(|_| anyhow::anyhow!("TLS handshake timeout"))??;
@@ -191,7 +217,10 @@ async fn handle_connection(
 
     let io = hyper_util::rt::TokioIo::new(tls_stream);
 
-    let hyper_service = hyper::service::service_fn(move |req| {
+    // Inject the real client IP into every request so axum handlers
+    // and the proxy can read it for X-Forwarded-* headers.
+    let hyper_service = hyper::service::service_fn(move |mut req| {
+        req.extensions_mut().insert(peer_addr);
         let app = app.clone();
         async move {
             match app.oneshot(req).await {
@@ -213,8 +242,13 @@ async fn handle_connection(
     Ok(())
 }
 
-fn create_router() -> Router {
-    Router::new()
+// ---------------------------------------------------------------------------
+// Router and handlers
+// ---------------------------------------------------------------------------
+
+/// Build the application router with routes, proxy fallback, and middleware.
+fn create_app(proxy_state: Arc<ReverseProxy>, cfg: &ResolvedConfig) -> Router {
+    let mut router = Router::new()
         .route("/", get(handler_root))
         .route("/health", get(handler_health))
         .route("/health/cert", get(handler_cert_health))
@@ -222,6 +256,21 @@ fn create_router() -> Router {
             "/.well-known/acme-challenge/:token",
             get(handle_acme_challenge),
         )
+        .fallback(proxy::proxy_handler)
+        .with_state(proxy_state)
+        .layer(TraceLayer::new_for_http())
+        .layer(CorsLayer::permissive())
+        .layer(CompressionLayer::new());
+
+    // Conditionally add HSTS (disabled if max-age is 0)
+    if !cfg.hsts_value.is_empty() {
+        router = router.layer(SetResponseHeaderLayer::overriding(
+            header::STRICT_TRANSPORT_SECURITY,
+            axum::http::HeaderValue::from_str(&cfg.hsts_value).expect("Invalid HSTS header value"),
+        ));
+    }
+
+    router
 }
 
 async fn handler_root() -> Html<&'static str> {
